@@ -1,0 +1,176 @@
+Quiero hacer algo como esto
+
+
+Transferencia de Función de Transferencia: Uso de Redes Neuronales para Transplantar la Respuesta Electrónica Real en un Modelo de Simulación de Muones
+--------------------------------------------------------------------
+
+Objetivo
+====
+Desarrollar un emulador neuronal que aprenda la relación entre la forma de onda de un pulso de muón simulado, la respuesta en frecuencia de la electrónica (en dB) y la métrica de salida final (máximo número de #1's consecutivos). El objetivo final es "transplantar" la respuesta en frecuencia real medida en el laboratorio en el pipeline de simulación, prediciendo cómo cambiaría la distribución de #unos observada en el campo, sin necesidad de costosas simulaciones de SPICE (que además no se logró hacer).
+
+Que necesito?
+=========================
+- Un dataset así:
+    * X1 - Señales de Muones Simuladas: Un tensor de tamaño (num_ejemplos, 3000, 1) que contiene las formas de onda temporales de los pulsos de muones (ya normalizadas entre 0-1 o estandarizadas)
+
+    * H_sim - Respuesta en Frecuencia Simulada (LTSpice) [dB]: Un tensor de tamaño (num_ejemplos, n_features) donde cada fila es el mismo vector H_sim_dB (la respuesta simulada en dB, preprocesada y normalizada).
+        - Nota: Dado que la respuesta simulada es fija, este tensor va a ser el mismo vector H_sim(ω) repetido para cada ejemplo de muón.
+
+    * Y_sim - Target de Entrenamiento (LTSpice): Un tensor de tamaño (num_ejemplos,) que contiene el máximo número de #1's consecutivos obtenido de la simulación de LTSpice para cada pulso de entrada (normalizado por un valor máximo, e.g., 3000).
+
+    * H_real - Respuesta en Frecuencia Real (VNA+Pitaya) [dB]: Un solo vector de tamaño (1, n_features) que representa la respuesta medida fusionada, preprocesada y normalizada de la misma manera que H_sim_dB, lista para ser usada en la fase de "transplante".
+
+Key design choices
+==================
+1. Preprocesamiento de H(ω) (La Parte Más Delicada):
+    * Fusión VNA+Pitaya: Se combinarán las dos mediciones en una sola curva de respuesta en frecuencia.
+        - VNA (ganancia_0.s2p): Se usará el parámetro S21 (dB) para la región de alta frecuencia. Se seleccionarán ~500 puntos equiespaciados en escala logarítmica entre f_min = 1e3 y f_max = 1e9 Hz.
+        - Pitaya (full_chain_gain0.csv): Se usará para la región de baja frecuencia (< 300 kHz). El valor en 300 kHz se alineará (escalará) con el valor del VNA en esa misma frecuencia para crear una curva continua.
+    
+    * Procesamiento:
+        - Escala de Frecuencia: Remuestrear en puntos equiespaciados logarítmicamente entre 1e4 y 1e9 Hz.
+        - Magnitud: Trabajar directamente en dB. Normalizar setting el máximo a 0 dB [H_normalized_dB = H_dB - max(H_dB)]
+        - Enmascarado: Forzar valores a -100 dB para frecuencias fuera del rango [1e3, 1e9] Hz.
+        - Características Finales: El vector de entrada será la magnitud en dB normalizada (H_normalized_dB). n_features ≈ 500 (a decidir pero 500 me parece poco, tal vez 1000).
+
+2. Arquitectura de la Red (PyTorch):
+    * Rama 1 (Procesamiento de Señal - CNN 1D): 
+        - Input: (batch_size, 1, 3000) -> aca el 3000 viene de la cantidad de puntos en las señales de muones
+        - Capas: Conv1d (kernels: 15, 10, 5) + ReLU + MaxPool1d
+        - Salida: Global Average Pooling o Flatten
+
+    * Rama 2 (Procesamiento de Respuesta en Frecuencia - MLP):
+        - Input: (batch_size, n_features)
+        - Capas: Linear (128, 128) + ReLU
+
+    * Fusión: Concatenación de los vectores de características de ambas ramas
+    * Cabezal de Regresión:
+        - Capas: Linear (256, 128) + ReLU + Dropout(0.3)
+        - Output: Linear(128, 1) (predicción del #unos normalizado)
+
+3. Flujo de Trabajo:
+    * Fase 1 - Entrenamiento: 
+        - Entrenar Modelo([X1, H_sim]) → Y_sim usando MSELoss y Adam
+        - Validar que pueda replicar la distribución de #unos de LTSpice
+    * Fase 2 - Transplante:
+        - Congelar pesos del modelo entrenado
+        - Predecir con Modelo([X1, H_real]) donde H_real se repite para cada muón
+        - Comparar el histograma resultante con los datos reales del campo
+
+4. Framework y Hardware:
+    * PyTorch para construcción y entrenamiento
+    * GPU NVIDIA GTX 1650 para aceleración (model.to('cuda'))
+
+Datos Disponibles
+==================
+- VNA: \Laboratorio_6_7_ITeDA\Mediciones\Mediciones CITI VNA\2024-12-03\Citi1-P12-FS\ganancia_0.s2p
+  (≈4500 puntos, usar columna 'S21 (dB)')
+- Pitaya: \Laboratorio_6_7_ITeDA\Mediciones\Mediciones Pitaya\29.11.2024\full_chain_gain0.csv
+  (500 puntos, usar primeras dos columnas: Freq_Hz y Atenuacion_dB)
+
+Función para leer .s2p:
+```python
+def read_s2p_file(file_path):
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+    
+    data = [line.strip().split() for line in lines if not (line.startswith('#') or line.startswith('!'))]
+    
+    df = pd.DataFrame(data, columns=[
+        'Frequency (Hz)', 'S11 (dB)', 'S11 (Angle)', 
+        'S21 (dB)', 'S21 (Angle)', 'S12 (dB)', 
+        'S12 (Angle)', 'S22 (dB)', 'S22 (Angle)'
+    ])
+    
+    df = df.apply(pd.to_numeric)
+    return df
+
+
+
+Dibujo esquematico de la red
+============================
+
+
+                ┌───────────────────────────────────────────────────┐
+                │                    Input Layer                    │
+                └─────────────────────────┬─────────────────────────┘
+                                          │
+                  ┌───────────────────────┴──────────────────┐
+                  │                                          │
+      ┌───────────▼────────────────────┐         ┌───────────▼─────────────────┐
+      │       Rama 1: Muones           │         │    Rama 2: Respuesta        │
+      │(Input: [batch, 1, n_feat_muon])│         │(Input: [batch, n_feat_frec])│
+      └──────────────────┬─────────────┘         └─────────┬───────────────────┘
+                         │                                 │
+             ┌───────────▼───────────┐         ┌───────────▼───────────┐
+             │ Conv1D(32, kernel=15) │         │     Dense(128)        │
+             │       ReLU            │         │        ReLU           │
+             └───────────┬───────────┘         └───────────┬───────────┘
+                         │                                 │
+             ┌───────────▼───────────┐         ┌───────────▼───────────┐
+             │     MaxPool1d(2)      │         │     Dense(64)         │
+             └───────────┬───────────┘         │        ReLU           │
+                         │                     └───────────┬───────────┘
+             ┌───────────▼───────────┐                     │
+             │ Conv1D(64, kernel=10) │                     │
+             │       ReLU            │                     │
+             └───────────┬───────────┘                     │
+                         │                                 │
+             ┌───────────▼───────────┐                     │
+             │     MaxPool1d(2)      │                     │
+             └───────────┬───────────┘                     │
+                         │                                 │
+             ┌───────────▼───────────┐                     │
+             │  Conv1D(128, kernel=5)│                     │
+             │       ReLU            │                     │
+             └───────────┬───────────┘                     │
+                         │                                 │
+             ┌───────────▼───────────┐                     │
+             │   GlobalAvgPool1d()   │                     │
+             └───────────┬───────────┘                     │
+                         │                                 │
+             ┌───────────▼───────────┐         ┌───────────▼───────────┐
+             │   Embedding Muones    │         │  Embedding Frecuencia │
+             │     (vector v1)       │         │      (vector v2)      │
+             └───────────┬───────────┘         └───────────┬───────────┘
+                         └─────────────────┬───────────────┘
+                                           │
+                             ┌─────────────▼─────────────┐
+                             │       Concatenación       │
+                             │   (v1 + v2 → merged)      │
+                             └─────────────┬─────────────┘
+                                           │
+                             ┌─────────────▼─────────────┐
+                             │       Dense(128)          │
+                             │         ReLU              │
+                             └─────────────┬─────────────┘
+                                           │
+                             ┌─────────────▼─────────────┐
+                             │       Dropout(0.3)        │
+                             └─────────────┬─────────────┘
+                                           │
+                             ┌─────────────▼─────────────┐
+                             │       Dense(64)           │
+                             │         ReLU              │
+                             └─────────────┬─────────────┘
+                                           │
+                             ┌─────────────▼─────────────┐
+                             │       Dense(1)            │
+                             │      (output linear)      │
+                             └─────────────┬─────────────┘
+                                           │
+                             ┌─────────────▼─────────────┐
+                             │   Predicción #unos norm   │
+                             │     (Simulación/Real)     │
+                             └───────────────────────────┘
+
+
+
+
+Rama 1 (CNN): 62,144 parámetros
+
+Rama 2 (MLP): 72,384 parámetros
+
+Capas de Fusión: 33,089 parámetros
+
+TOTAL OPTIMIZADO: 167,617 parámetros
